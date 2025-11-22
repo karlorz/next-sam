@@ -4,18 +4,15 @@ import React, {
   useState,
   useEffect,
   useRef,
-  createContext,
-  useCallback,
 } from "react";
 import { Analytics } from "@vercel/analytics/next";
 import { cn } from "@/lib/utils";
+import { MODEL_CONFIG, DEFAULT_MODEL } from "./modelConfig.js";
 
 // UI
 import {
   Card,
   CardContent,
-  CardDescription,
-  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -23,18 +20,15 @@ import InputDialog from "@/components/ui/inputdialog";
 import { Button } from "@/components/ui/button";
 import {
   LoaderCircle,
-  Crop,
   ImageUp,
   ImageDown,
   Github,
-  LoaderPinwheel,
   Fan,
 } from "lucide-react";
 
 // Image manipulations
 import {
   resizeCanvas,
-  mergeMasks,
   maskImageCanvas,
   resizeAndPadBox,
   canvasToFloat32Array,
@@ -44,9 +38,13 @@ import {
 } from "@/lib/imageutils";
 
 export default function Home() {
-  // resize+pad all images to 1024x1024
-  const imageSize = { w: 1024, h: 1024 };
-  const maskSize = { w: 256, h: 256 };
+  // Model selection
+  const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL);
+  const modelConfig = MODEL_CONFIG[selectedModel];
+
+  // resize+pad all images based on selected model config
+  const imageSize = modelConfig.imageSize;
+  const maskSize = modelConfig.maskSize;
 
   // state
   const [device, setDevice] = useState(null);
@@ -130,17 +128,37 @@ export default function Home() {
 
   // Decoding finished -> parse result and update mask
   const handleDecodingResults = (decodingResults) => {
-    // SAM2 returns 3 mask along with scores -> select best one
+    // SAM2 returns 3 masks along with scores -> select best one
+    // MobileSAM returns 4 masks and may have IoU scores > 1.0 (valid high-confidence)
     const maskTensors = decodingResults.masks;
-    const [bs, noMasks, width, height] = maskTensors.dims;
+    const [, , width, height] = maskTensors.dims;
     const maskScores = decodingResults.iou_predictions.cpuData;
-    const bestMaskIdx = maskScores.indexOf(Math.max(...maskScores));
-    const bestMaskArray = sliceTensor(maskTensors, bestMaskIdx)
-    let bestMaskCanvas = float32ArrayToCanvas(bestMaskArray, width, height)
-    bestMaskCanvas = resizeCanvas(bestMaskCanvas, imageSize);
 
+    // CRITICAL FIX: Avoid stack overflow with spread operator on large arrays
+    // Use manual iteration to find max score (handles IoU > 1.0)
+    let bestMaskIdx = 0;
+    let bestScore = -Infinity;
+    for (let i = 0; i < maskScores.length; i++) {
+      if (maskScores[i] > bestScore) {
+        bestScore = maskScores[i];
+        bestMaskIdx = i;
+      }
+    }
+
+    const bestMaskArray = sliceTensor(maskTensors, bestMaskIdx);
+    let bestMaskCanvas = float32ArrayToCanvas(bestMaskArray, width, height);
+
+    // Resize to image dimensions for display
+    bestMaskCanvas = resizeCanvas(bestMaskCanvas, imageSize);
     setMask(bestMaskCanvas);
-    setPrevMaskArray(bestMaskArray);
+
+    // Store mask for refinement - resize to maskSize for decoder input
+    const refinementMaskCanvas = resizeCanvas(
+      float32ArrayToCanvas(bestMaskArray, width, height),
+      maskSize
+    );
+    const refinementMaskArray = maskCanvasToFloat32Array(refinementMaskCanvas);
+    setPrevMaskArray(refinementMaskArray);
   };
 
   // Handle web worker messages
@@ -175,7 +193,7 @@ export default function Home() {
   };
 
   // Crop image with mask
-  const cropClick = (event) => {
+  const cropClick = () => {
     const link = document.createElement("a");
     link.href = maskImageCanvas(image, mask).toDataURL();
     link.download = "crop.png";
@@ -217,18 +235,45 @@ export default function Home() {
     samWorker.current.postMessage({ type: "stats" });
   }
 
-  // Load web worker
-  useEffect(() => {
-    if (!samWorker.current) {
-      samWorker.current = new Worker(new URL("./worker.js", import.meta.url), {
-        type: "module",
-      });
-      samWorker.current.addEventListener("message", onWorkerMessage);
-      samWorker.current.postMessage({ type: "ping" });
+  // Handle model selection change
+  const handleModelChange = (event) => {
+    const newModelId = event.target.value;
+    setSelectedModel(newModelId);
 
-      setLoading(true);
+    // Reset encoding state but keep the loaded image
+    pointsRef.current = [];
+    setMask(null);
+    setPrevMaskArray(null);
+    setImageEncoded(false);
+    setStatus("Encode image");
+  };
+
+  // Load web worker - recreate when model changes
+  useEffect(() => {
+    // Terminate existing worker if present
+    if (samWorker.current) {
+      samWorker.current.terminate();
+      samWorker.current = null;
     }
-  }, [onWorkerMessage, handleDecodingResults]);
+
+    // Create new worker with selected model
+    samWorker.current = new Worker(new URL("./worker.js", import.meta.url), {
+      type: "module",
+    });
+    samWorker.current.addEventListener("message", onWorkerMessage);
+    samWorker.current.postMessage({ type: "ping", data: { modelId: selectedModel } });
+
+    setLoading(true);
+
+    // Cleanup on unmount or model change
+    return () => {
+      if (samWorker.current) {
+        samWorker.current.terminate();
+        samWorker.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedModel]);
 
   // Load image, pad to square and store in offscreen canvas
   useEffect(() => {
@@ -290,21 +335,26 @@ export default function Home() {
 
   // Mask changed, draw original image and mask on top with some alpha
   useEffect(() => {
-    if (mask) {
-      const canvas = canvasEl.current;
-      const ctx = canvas.getContext("2d");
+    if (!image) return;
 
-      ctx.drawImage(
-        image,
-        0,
-        0,
-        image.width,
-        image.height,
-        0,
-        0,
-        canvas.width,
-        canvas.height
-      );
+    const canvas = canvasEl.current;
+    const ctx = canvas.getContext("2d");
+
+    // Always redraw the base image first
+    ctx.drawImage(
+      image,
+      0,
+      0,
+      image.width,
+      image.height,
+      0,
+      0,
+      canvas.width,
+      canvas.height
+    );
+
+    // If mask exists, overlay it
+    if (mask) {
       ctx.globalAlpha = 0.7;
       ctx.drawImage(
         mask,
@@ -329,7 +379,7 @@ export default function Home() {
             variant="outline"
             size="sm"
             onClick={() =>
-              window.open("https://github.com/geronimi73/next-sam", "_blank")
+              window.open("https://github.com/karlorz/next-sam", "_blank")
             }
           >
             <Github className="w-4 h-4 mr-2" />
@@ -340,20 +390,40 @@ export default function Home() {
           <CardTitle>
             <div className="flex flex-col gap-2">
               <p>
-                Clientside Image Segmentation with onnxruntime-web and Meta's SAM2
+                Clientside Image Segmentation with onnxruntime-web and Meta&apos;s SAM2
               </p>
-              <p
-                className={cn(
-                  "flex gap-1 items-center",
-                  device ? "visible" : "invisible"
-                )}
-              >
-                <Fan
-                  color="#000"
-                  className="w-6 h-6 animate-[spin_2.5s_linear_infinite] direction-reverse"
-                />
-                Running on {device}
-              </p>
+              <div className="flex items-center gap-4">
+                <div className="flex items-center gap-2">
+                  <label htmlFor="model-select" className="text-sm font-normal">
+                    Model:
+                  </label>
+                  <select
+                    id="model-select"
+                    value={selectedModel}
+                    onChange={handleModelChange}
+                    disabled={loading}
+                    className="px-3 py-1 text-sm border rounded-md bg-white disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {Object.values(MODEL_CONFIG).map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <p
+                  className={cn(
+                    "flex gap-1 items-center",
+                    device ? "visible" : "invisible"
+                  )}
+                >
+                  <Fan
+                    color="#000"
+                    className="w-6 h-6 animate-[spin_2.5s_linear_infinite] direction-reverse"
+                  />
+                  Running on {device}
+                </p>
+              </div>
             </div>
           </CardTitle>
         </CardHeader>
