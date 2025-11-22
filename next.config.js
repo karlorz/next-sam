@@ -2,8 +2,25 @@
 
 const path = require('path');
 
+const isGitHubPages = process.env.GITHUB_PAGES === 'true';
+const repoName = process.env.REPO_NAME || 'next-sam';
+
 const nextConfig = {
-    webpack: (config) => {        
+    // Enable static export for GitHub Pages
+    output: 'export',
+
+    // Set basePath for GitHub Pages (https://<user>.github.io/<repo>/)
+    basePath: isGitHubPages ? `/${repoName}` : '',
+
+    // Asset prefix for GitHub Pages
+    assetPrefix: isGitHubPages ? `/${repoName}/` : '',
+
+    // Disable image optimization (requires server)
+    images: {
+        unoptimized: true,
+    },
+
+    webpack: (config) => {
         // See https://webpack.js.org/configuration/resolve/#resolvealias
         config.resolve.alias = {
             ...config.resolve.alias,
