@@ -13,3 +13,5 @@ notebooks/.ipynb_checkpoints/SAM2-to-ONNX-checkpoint.ipynb
 *.pt
 *.onnx
 *.ort
+
+CLAUDE.local.md
