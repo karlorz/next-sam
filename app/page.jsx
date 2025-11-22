@@ -214,12 +214,20 @@ export default function Home() {
 
   // New image: From File
   const handleFileUpload = (e) => {
-    const file = e.target.files[0]
-    const dataURL = window.URL.createObjectURL(file)
+    // Guard clause - prevents TypeError when no file selected
+    const file = e.target.files?.[0];
+    if (!file) {
+      return;  // User cancelled file dialog, do nothing
+    }
 
-    resetState()
-    setStatus("Encode image")
-    setImageURL(dataURL)
+    resetState();
+
+    const dataURL = window.URL.createObjectURL(file);
+    setImageURL(dataURL);
+    setStatus("Encode image");
+
+    // Reset input to allow re-selecting the same file
+    e.target.value = null;
   }
 
   // New image: From URL 
@@ -311,6 +319,13 @@ export default function Home() {
         setImage(canvas);
       };
     }
+
+    // Cleanup: revoke blob URL to prevent memory leaks
+    return () => {
+      if (imageURL && imageURL.startsWith('blob:')) {
+        URL.revokeObjectURL(imageURL);
+      }
+    };
   }, [imageURL]);
 
   // Offscreen canvas changed, draw it
@@ -490,12 +505,12 @@ export default function Home() {
         submitCallback={handleUrl}
         defaultURL={inputDialogDefaultURL}
         />
-      <input 
-        ref={fileInputEl} 
-        hidden="True" 
-        accept="image/*" 
-        type='file' 
-        onInput={handleFileUpload} 
+      <input
+        ref={fileInputEl}
+        hidden="True"
+        accept="image/*"
+        type='file'
+        onChange={handleFileUpload}
         />
       <Analytics />
     </div>
